@@ -1,0 +1,64 @@
+services:
+
+  web:
+    build: ./app
+
+    ports:
+      - "5000:5000"
+
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=db
+      - POSTGRES_DB=urlshortener
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=urlshortener
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./app/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+
+    # Bu dosya 3 servisten oluşur:
+#
+# web:
+#   Flask API servisidir. ./app klasöründen build edilir
+#   ve host makinede 5000 portundan erişilir.
+#
+# db:
+#   PostgreSQL veritabanıdır. URL eşleşmelerini kalıcı olarak saklar.
+#   pg_isready healthcheck'i ile bağlantı kabul etmeye hazır olup olmadığı kontrol edilir.
+#
+# redis:
+#   Hızlı URL sorgulamaları için cache olarak kullanılır.
+#   redis-cli ping komutu ile servisin hazır olduğu kontrol edilir.
+#
+# depends_on + condition: service_healthy:
+#   Flask API'nin PostgreSQL ve Redis tamamen hazır olmadan
+#   başlamasını engeller.
