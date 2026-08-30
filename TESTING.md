@@ -292,13 +292,15 @@ docker compose logs web --tail 20
 
 Bu bölüm testleri bitirdikten sonra tekrar okumak içindir.
 
-### Cache-Aside vs Write-Through
 
-|------------------------|    Cache-Aside (okuma)   | Write-Through              |
-|------------------------|-------------------------------------------------------|
-| Ne zaman dolar?        | Cache miss'te lazy       | Her yazmada                |
-| Bu projede             | Redirect okuması         | `/shorten` yazması         |
-| Redis boşalırsa        | Sistem çalışır, yavaşlar | Yazma sırasında zaten dolu |
+
+## Cache-Aside vs Write-Through
+
+|                        | Cache-Aside (okuma)| Write-Through              |
+|------------------------|---------------------------|----------------------------|
+| Ne zaman dolar?        | Cache miss'te lazy        | Her yazmada                |
+| Bu projede             | Redirect okuması          | `/shorten` yazması         |
+| Redis boşalırsa        | Sistem çalışır, yavaşlar  | Yazma sırasında zaten dolu |
 
 ### Fixed-Window vs Sliding-Window
 
