@@ -9,6 +9,8 @@ Flask tabanlı bir URL kısaltma servisi. Uzun URL'leri PostgreSQL'de kalıcı o
 - **GET `/health`** — Servis sağlık kontrolü
 - Redis cache-aside ile hızlı okuma
 - IP bazlı rate limiting (`/shorten` için 10 istek / dakika)
+- NGINX reverse proxy üzerinden tek public giriş noktası
+- Üç Flask replica arasında round-robin load balancing
 
 ## Hızlı Başlangıç
 
@@ -17,7 +19,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Servisler hazır olduğunda:
+Servisler hazır olduğunda bütün client isteklerini NGINX'in public ingress'i olan `http://localhost` adresine gönderin. Flask'ın internal `:5000` portu host'a açık değildir:
 ''powerShell-native , kendi shellinize uygun olarak convert edin..
 
 $body = @{
@@ -25,7 +27,7 @@ $body = @{
 } | ConvertTo-Json
 
 Invoke-RestMethod `
-    -Uri "http://localhost:5000/shorten" `
+    -Uri "http://localhost/shorten" `
     -Method POST `
     -ContentType "application/json" `
     -Body $body
@@ -34,7 +36,7 @@ Invoke-RestMethod `
 
 ```json
 {
-  "short_url": "http://localhost:5000/1",
+  "short_url": "http://localhost/1",
   "short_code": "1"
 }
 ```
@@ -42,46 +44,53 @@ Invoke-RestMethod `
 Redirect testi:
 
 ```powershell
-curl.exe -I http://localhost:5000/1
+curl.exe -I http://localhost/1
 ```
 
-Detaylı test adımları için [app/TESTING.md](app/TESTING.md) dosyasına bakın.
+Detaylı test adımları için [TESTING.md](TESTING.md) dosyasına bakın.
 
 ## Proje Yapısı
 
 ```text
 url-shortener/
-├── docker-compose.yml    # web, db, redis servisleri
+├── docker-compose.yml    # nginx, 3 web replica, db ve redis
+├── nginx/
+│   └── nginx.conf        # Reverse proxy ve load balancer config
+├── docs/
+│   └── nginx-reverse-proxy-and-load-balancing.md
 ├── README.md
+├── TESTING.md            # Manuel test rehberi
 └── app/
     ├── app.py            # Flask API
     ├── Dockerfile
     ├── init.sql          # PostgreSQL şema
-    ├── requirements.txt
-    └── TESTING.md        # Manuel test rehberi
+    └── requirements.txt
 ```
 
 ## Mimari Genel Bakış
 
 ```text
 Client
+  │ http://localhost
+  ▼
+NGINX :80 (reverse proxy + load balancer)
   │
-  ├─ POST /shorten ──► Flask ──► PostgreSQL (INSERT)
-  │                      │
-  │                      └──────► Redis (cache.set)
-  │
-  └─ GET /{code} ──────► Flask ──► Redis (cache.get)
-                           │
-                           ├─ HIT  ──► 302 Redirect
-                           │
-                           └─ MISS ──► PostgreSQL (SELECT)
-                                        │
-                                        └─► Redis'e yaz + 302 Redirect
+  ├─► Flask web-1 :5000
+  ├─► Flask web-2 :5000
+  └─► Flask web-3 :5000
+         │
+         ├─ POST /shorten ──► PostgreSQL (INSERT) ──► Redis (cache.set)
+         │
+         └─ GET /{code} ────► Redis (cache.get)
+                                ├─ HIT  ──► 302 Redirect
+                                └─ MISS ──► PostgreSQL (SELECT)
+                                             └─► Redis'e yaz + 302 Redirect
 ```
 
 | Katman | Rol | Teknoloji |
 |--------|-----|-----------|
-| API | HTTP isteklerini işler | Flask |
+| Public ingress | Reverse proxy ve load balancing | NGINX |
+| API | HTTP isteklerini işler | Üç Flask replica |
 | Kalıcı depolama | Source of truth | PostgreSQL |
 | Hız katmanı | Redirect cache + rate limit sayaçları | Redis |
 
@@ -91,11 +100,12 @@ Client
 
 ### 1. Docker Compose ve Service Discovery
 
-Docker Compose `web`, `db` ve `redis` servislerini aynı özel Docker ağına bağlar. Bu ağda servis adları aynı zamanda hostname olarak çözülür:
+Docker Compose `nginx`, `web`, `db` ve `redis` servislerini aynı özel Docker ağına bağlar. `web` service'i üç replica olarak çalışır. Bu ağda servis adları aynı zamanda hostname olarak çözülür:
 
 | Servis adı | Bileşen |
 |------------|---------|
-| `web` | Flask API |
+| `nginx` | Public reverse proxy ve load balancer |
+| `web` | Üç replica olarak çalışan Flask API |
 | `db` | PostgreSQL |
 | `redis` | Redis |
 
@@ -169,7 +179,7 @@ Bu bir **fixed-window** limiter'dır. Sayaç her 60 saniyede sıfırlanır.
 
 Redis'in `INCR` işlemi atomiktir ve eşzamanlı sayaç artışlarında veri kaybını önler. TTL ile sayaç otomatik silinir; ayrı temizleme job'u gerekmez. Mevcut fixed-window implementasyonu eğitim amaçlı basit tutulmuştur: önce `GET` ile sayaç kontrol edilir, ardından `INCR` yapılır — bu iki adım birlikte atomik değildir ve çok eşzamanlı isteklerde limit teorik olarak birkaç istek aşılabilir.
 
-**Mevcut sınırlama:** Rate limiter `request.remote_addr`değerini kullanır.Docker networking veya reverse proxy arkasında bu değer gerçek client IP yerine proxy/gateway adresi olabilir.(NGINX) eklendiğinde `X-Forwarded-For` header'ı okunmalıdır — bu, planlanan NGINX katmanında ele alınacak.
+NGINX client IP'sini `X-Forwarded-For` ile Flask'a iletir. Flask uygulaması `ProxyFix(x_for=1)` ile yalnızca önündeki tek NGINX proxy hop'una güvenir; böylece `request.remote_addr` ve Redis'teki rate-limit key'i gerçek client kimliğini kullanır.
 
 ### 6. Veri Akışı Özeti
 
@@ -191,30 +201,27 @@ Redis GET → HIT  → 302
                  → 302
 ```
 
-### 7. Tek Instance Sınırları (Mevcut Durum)
+### 7. Mevcut NGINX ve Replica Mimarisi
 
-Şu anki mimari bilinçli olarak basit tutulmuştur:
+Şu anki mimaride:
 
-- Tek Flask container (`web`) — horizontal scaling yok
-- Tek Redis instance — cluster/replication yok
-- Tek PostgreSQL instance — read replica yok
-- Load balancer yok — tüm trafik doğrudan `:5000`'e gider
+- NGINX host portu `80` üzerinden tek public ingress sağlar.
+- Üç Flask `web` replica yalnızca Compose network içinde `:5000` portunda çalışır.
+- NGINX request'leri replica'lar arasında round-robin dağıtır.
+- Replica'lar aynı PostgreSQL ve Redis servislerini paylaşır.
+- Tek Redis ve tek PostgreSQL instance kullanılmaya devam eder.
 
-Bu sınırlar öğrenme ve demo için uygundur. Production'da bu katmanların ölçeklendirilmesi gerekir.
+Client trafiği doğrudan Flask'a değil `http://localhost` üzerinden NGINX'e gider.
 
 ---
 
 ## Yol Haritası
 
-Aşağıdaki geliştirmeler planlanmaktadır. Mevcut dokümantasyon ve testler **tek instance** mimarisine göre yazılmıştır; bu özellikler eklendikçe güncellenecektir.
+NGINX reverse proxy, horizontal Flask scaling, gerçek client IP'siyle rate limiting ve public short URL üretimi tamamlanmıştır. Planlanan sonraki çalışma:
 
 | # | Özellik | Beklenen etki |
 |---|---------|---------------|
-| 1 | **NGINX load balancing** | Trafik dağıtımı, reverse proxy, `X-Forwarded-For` ile gerçek IP |
-| 2 | **Horizontal Flask replicas** | Birden fazla `web` instance, stateless API ölçeklendirme |
-| 3 | **k6 load testing** | Throughput, latency ve rate limit davranışının ölçülmesi |
-
-NGINX eklendiğinde client `:80` veya `:8080` üzerinden erişecek; Flask replicaları doğrudan dışarıya açılmayacak. Rate limit ve cache testleri bu mimariye göre revize edilecek.
+| 1 | **k6 load testing** | Throughput, latency ve rate limit davranışının ölçülmesi |
 
 ---
 
@@ -227,7 +234,7 @@ NGINX eklendiğinde client `:80` veya `:8080` üzerinden erişecek; Flask replic
 { "url": "https://example.com" }
 
 // Response 201
-{ "short_url": "http://localhost:5000/1", "short_code": "1" }
+{ "short_url": "http://localhost/1", "short_code": "1" }
 
 // Response 400 — url alanı eksik
 // Response 429 — rate limit aşıldı

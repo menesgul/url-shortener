@@ -5,8 +5,12 @@ from functools import wraps
 from flask import Flask, request, redirect, jsonify
 import redis
 import psycopg2
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost").rstrip("/")
 
 # Define the 62 characters used for short codes (0-9, a-z, A-Z)
 ALPHABET = string.digits + string.ascii_lowercase + string.ascii_uppercase
@@ -119,7 +123,7 @@ def shorten_url():
     # Cache the mapping for fast redirects later
     cache.set(short_code, long_url)
 
-    return jsonify({"short_url": f"http://localhost:5000/{short_code}", "short_code": short_code}), 201
+    return jsonify({"short_url": f"{PUBLIC_BASE_URL}/{short_code}", "short_code": short_code}), 201
     
 # Receive long URL → store in database → get a unique ID back →
 # encode that ID into a short code → cache it → return the short URL.

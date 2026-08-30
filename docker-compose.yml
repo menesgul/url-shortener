@@ -1,12 +1,25 @@
 services:
 
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - web
+
   web:
     build: ./app
 
-    ports:
-      - "5000:5000"
+    expose:
+      - "5000"
+
+    deploy:
+      replicas: 3
 
     environment:
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - POSTGRES_HOST=db
@@ -45,11 +58,16 @@ services:
 volumes:
   postgres_data:
 
-    # Bu dosya 3 servisten oluşur:
+    # Bu dosya 4 servisten oluşur:
+#
+# nginx:
+#   Dışarıdan gelen HTTP trafiğinin giriş noktasıdır. Host makinede 80 portunu
+#   yayınlar ve tüm istekleri Docker ağı üzerinden web:5000 adresine iletir.
 #
 # web:
-#   Flask API servisidir. ./app klasöründen build edilir
-#   ve host makinede 5000 portundan erişilir.
+#   Flask API servisidir. ./app klasöründen tek bir image build edilir ve bu
+#   image'dan 3 replica çalışır. Replicalar yalnızca Docker ağı içinde 5000
+#   portundan erişilir; aynı PostgreSQL ve Redis servislerini paylaşırlar.
 #
 # db:
 #   PostgreSQL veritabanıdır. URL eşleşmelerini kalıcı olarak saklar.
