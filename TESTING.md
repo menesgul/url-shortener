@@ -2,7 +2,7 @@
 
 Bu dosya, URL Shortener projesini **adım adım test etmek** ve **mimari kavramları tekrar etmek** için yazılmıştır. Her bölümde ne yaptığınız, ne beklemeniz gerektiği ve neden önemli olduğu açıklanır.
 
-> **Not:** Bu rehber mevcut **tek Flask instance** mimarisine göredir. NGINX load balancing, horizontal Flask replicaları ve k6 load testleri eklendiğinde ilgili bölümler güncellenecektir.
+> **Mimari geçiş notu:** Projenin NGINX öncesindeki başlangıç aşamasında Flask doğrudan `http://localhost:5000` üzerinden test ediliyordu. Bu tarihsel adımlar [NGINX mimari rehberinde](docs/nginx-reverse-proxy-and-load-balancing.md) korunur. Aşağıdaki komutlar mevcut/final yapıyı test eder: client trafiği `http://localhost` üzerinden NGINX'e gider ve NGINX üç Flask replica arasında load balancing yapar. Host portu `5000` artık doğrudan erişime kapalıdır.
 
 ---
 
@@ -33,11 +33,12 @@ docker compose ps
 
 | Servis | Beklenen durum |
 |--------|----------------|
-| `web` | Up |
+| `nginx` | Up; host portu `80` publish edilmiş |
+| `web` | Üç replica Up; yalnızca internal `5000/tcp` |
 | `db` | healthy |
 | `redis` | healthy |
 
-Servisler hazır değilse birkaç saniye bekleyip tekrar kontrol edin.
+Servisler hazır değilse birkaç saniye bekleyip tekrar kontrol edin. Bundan sonraki HTTP komutları NGINX'in public ingress'i olan `http://localhost` adresini kullanır.
 
 ### Test verisi oluşturun
 
@@ -46,9 +47,9 @@ Aşağıdaki testlerde kısa kod `3` varsayılır. Kendi ortamınızda farklı b
 Önce bir URL kısaltın:
 
 ```powershell
-curl.exe -X POST http://localhost:5000/shorten `
+curl.exe -X POST http://localhost/shorten `
   -H "Content-Type: application/json" `
-  -d "{\"url\":\"https://redis.io/docs/latest/\"}"
+  -d '{"url":"https://redis.io/docs/latest/"}'
 ```
 
 Yanıttaki `short_code` değerini not alın. Örnek: `"short_code": "3"`.
@@ -84,7 +85,7 @@ Her adımda **Komut → Beklenen sonuç → Ne anlama gelir** formatı kullanıl
 **Komut:**
 
 ```powershell
-curl.exe -I http://localhost:5000/3
+curl.exe -I http://localhost/3
 ```
 
 **Beklenen sonuç:**
@@ -103,7 +104,7 @@ Location: https://redis.io/docs/latest/
 **Komut:**
 
 ```powershell
-curl.exe -I http://localhost:5000/3
+curl.exe -I http://localhost/3
 docker compose logs web --tail 5
 ```
 
@@ -115,7 +116,7 @@ CACHE HIT
 
 **Ne anlama gelir:** URL Redis'ten okundu; PostgreSQL'e gidilmedi. RAM tabanlı lookup milisaniyeler içinde tamamlanır.
 
-> Canlı log takibi için: `docker compose logs -f web` (durdurmak: `Ctrl+C`)
+> Canlı log takibi için: `docker compose logs -f web` (durdurmak: `Ctrl+C`). `docker compose logs web` üç replica'nın loglarını birlikte gösterir; isteği işleyen replica satırın container prefix'inden görülebilir.
 
 ---
 
@@ -146,7 +147,7 @@ Beklenen: `(nil)` — key artık yok.
 **Komut:**
 
 ```powershell
-curl.exe -I http://localhost:5000/3
+curl.exe -I http://localhost/3
 docker compose logs web --tail 5
 ```
 
@@ -183,7 +184,7 @@ https://redis.io/docs/latest/
 **Komut:**
 
 ```powershell 
-curl.exe -I http://localhost:5000/3
+curl.exe -I http://localhost/3
 docker compose logs web --tail 5
 ```
 
@@ -205,7 +206,7 @@ FLUSHALL → Redis boş
 
 ## 3. Rate limiting testi
 
-`/shorten` endpoint'i IP başına **10 istek / 60 saniye** ile sınırlandırılır. Limit Redis'te `rate_limit:{ip}` key'i ile tutulur.
+`/shorten` endpoint'i IP başına **10 istek / 60 saniye** ile sınırlandırılır. Limit Redis'te `rate_limit:{ip}` key'i ile tutulur. NGINX `X-Forwarded-For` header'ını ekler; Flask `ProxyFix(x_for=1)` ile tam olarak bir proxy hop'una güvendiği için `request.remote_addr` özgün client IP'sini temsil eder.
 
 ### Neden Redis?
 
@@ -222,7 +223,7 @@ $body = '{"url":"https://www.example.com"}'
 1..12 | ForEach-Object {
     try {
         $r = Invoke-WebRequest `
-            -Uri "http://localhost:5000/shorten" `
+            -Uri "http://localhost/shorten" `
             -Method POST `
             -ContentType "application/json" `
             -Body $body
@@ -260,7 +261,7 @@ IP'nize karşılık gelen key'i görebilirsiniz. Sayaç değeri:
 docker compose exec redis redis-cli GET "rate_limit:172.x.x.x"
 ```
 
-> Container ağı içinde IP Docker bridge adresi olabilir; bu normaldir.
+> Local Docker ortamında görülen adres host/VM ağına ait olabilir. Önemli olan farklı client IP'lerinin farklı `rate_limit:{ip}` key'leri kullanmasıdır.
 
 ### 429 almıyorsanız
 
@@ -338,21 +339,21 @@ docker compose up -d --build
 docker compose ps
 
 # URL oluştur
-curl.exe -X POST http://localhost:5000/shorten -H "Content-Type: application/json" -d "{\"url\":\"https://redis.io/docs/latest/\"}"
+curl.exe -X POST http://localhost/shorten -H "Content-Type: application/json" -d '{"url":"https://redis.io/docs/latest/"}'
 
 # Cache testi
-curl.exe -I http://localhost:5000/3
+curl.exe -I http://localhost/3
 docker compose exec redis redis-cli FLUSHALL
 docker compose exec redis redis-cli GET 3          # (nil) beklenir
-curl.exe -I http://localhost:5000/3                # CACHE MISS
+curl.exe -I http://localhost/3                # CACHE MISS
 docker compose logs web --tail 5
 docker compose exec redis redis-cli GET 3          # URL dönmeli
-curl.exe -I http://localhost:5000/3                # CACHE HIT
+curl.exe -I http://localhost/3                # CACHE HIT
 docker compose logs web --tail 5
 
 # Rate limit testi (12 istek)
 $body = '{"url":"https://www.example.com"}'
-1..12 | ForEach-Object { try { $r = Invoke-WebRequest -Uri "http://localhost:5000/shorten" -Method POST -ContentType "application/json" -Body $body; "$_ -> $($r.StatusCode)" } catch { "$_ -> $($_.Exception.Response.StatusCode.value__)" } }
+1..12 | ForEach-Object { try { $r = Invoke-WebRequest -Uri "http://localhost/shorten" -Method POST -ContentType "application/json" -Body $body; "$_ -> $($r.StatusCode)" } catch { "$_ -> $($_.Exception.Response.StatusCode.value__)" } }
 ```
 
 ---
@@ -362,6 +363,7 @@ $body = '{"url":"https://www.example.com"}'
 | Belirti                        |        Olası neden          |             Çözüm                    |
 |--------------------------------|-----------------------------|--------------------------------------|
 | `connection refused`           | Servisler henüz hazır değil | `docker compose ps`, birkaç sn bekle |
+| `localhost:5000` bağlantısı reddediliyor | Beklenen davranış; Flask host'a publish edilmez | `http://localhost` üzerinden NGINX'i kullan |
 | `404` redirect'te              | Kod DB'de yok               | Önce `/shorten` ile URL oluştur      |
 | CACHE HIT/MISS log yok         | Eski container              | `docker compose up -d --build web`   |
 | 429 gelmiyor                   | Rate limit decorator eksik  | `app.py` kontrol et, rebuild         |
@@ -371,10 +373,8 @@ $body = '{"url":"https://www.example.com"}'
 
 ## Gelecek güncellemeler
 
-Aşağıdaki özellikler eklendiğinde bu rehber genişletilecek:
+NGINX load balancing ve horizontal Flask replica testleri artık bu rehberin mevcut akışına dahildir. Gelecekte eklenecek çalışma:
 
 | Özellik | Test değişiklikleri |
 |---------|---------------------|
-| NGINX load balancing | Port `:80`, `X-Forwarded-For`, upstream dağılımı |
-| Horizontal Flask replicas | Hangi replica'nın log verdiği, sticky session gerekmez |
 | k6 load testing | Script'ler, throughput/latency metrikleri, rate limit eşiği |
