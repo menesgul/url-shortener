@@ -55,10 +55,21 @@ services:
       timeout: 5s
       retries: 5
 
+  k6:
+    image: grafana/k6:2.2.0
+    profiles:
+      - load-test
+    volumes:
+      - ./load-tests:/scripts:ro
+    environment:
+      - BASE_URL=http://nginx
+    depends_on:
+      - nginx
+
 volumes:
   postgres_data:
 
-    # Bu dosya 4 servisten oluşur:
+    # Bu dosya 5 servisten oluşur; k6 yalnızca load-test profiliyle opt-in çalışır:
 #
 # nginx:
 #   Dışarıdan gelen HTTP trafiğinin giriş noktasıdır. Host makinede 80 portunu
@@ -76,6 +87,10 @@ volumes:
 # redis:
 #   Hızlı URL sorgulamaları için cache olarak kullanılır.
 #   redis-cli ping komutu ile servisin hazır olduğu kontrol edilir.
+#
+# k6:
+#   load-test profiline bağlı opt-in yük testi çalıştırıcısıdır; normal
+#   docker compose up sırasında başlamaz.
 #
 # depends_on + condition: service_healthy:
 #   Flask API'nin PostgreSQL ve Redis tamamen hazır olmadan

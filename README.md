@@ -58,6 +58,9 @@ url-shortener/
 │   └── nginx.conf        # Reverse proxy ve load balancer config
 ├── docs/
 │   └── nginx-reverse-proxy-and-load-balancing.md
+├── load-tests/
+│   ├── redirect.js        # Cache-hit redirect deneyi
+│   └── rate-limit.js      # Sıralı/concurrent rate-limit deneyi
 ├── README.md
 ├── TESTING.md            # Manuel test rehberi
 └── app/
@@ -159,7 +162,7 @@ Redis bu akışta source of truth değildir; cache kaybı veri kaybına yol açm
 
 Her redirect isteğinde PostgreSQL sorgusu yapmak, Redis cache üzerinden servis etmeye göre daha fazla latency ve database yükü oluşturur. Redis RAM'de çalışır ve O(1) key lookup sunar. Rate limit sayaçları da Redis'te tutulur çünkü `INCR` atomiktir ve `EXPIRE` ile TTL destekler.
 
-### 5. Rate Limiting (Fixed-Window)
+### 5. Rate Limiting (Basitleştirilmiş sayaç + TTL)
 
 `/shorten` endpoint'i IP bazlı rate limit ile korunur: **10 istek / 60 saniye**.
 
@@ -169,15 +172,15 @@ Komutlar: INCR + EXPIRE (Redis pipeline ile birlikte çalıştırılır)
 Limit aşılırsa: HTTP 429
 ```
 
-Bu bir **fixed-window** limiter'dır. Sayaç her 60 saniyede sıfırlanır.
+Bu implementasyon fixed-window fikrini öğretmek için basit bir sayaç ve TTL kullanır, ancak katı takvim tabanlı bir fixed-window değildir. Kabul edilen her istekte `EXPIRE` yeniden 60 saniyeye ayarlanır; limit dolduğunda sayaç son kabul edilen istekten yaklaşık 60 saniye sonra silinir.
 
 |      Tür       |           Davranış              | Bu projede          |
 |----------------|---------------------------------|------------         |
-| Fixed-window   | Sabit pencerede sayaç           | ✓ Kullanılıyor      |
+| Fixed-window   | Sabit pencerede sayaç           | Kavramsal referans  |
 | Sliding-window | Son N saniyeyi sürekli hesaplar | Gelecek iyileştirme |
 | Token bucket   | Burst'e izin verir | Alternatif |
 
-Redis'in `INCR` işlemi atomiktir ve eşzamanlı sayaç artışlarında veri kaybını önler. TTL ile sayaç otomatik silinir; ayrı temizleme job'u gerekmez. Mevcut fixed-window implementasyonu eğitim amaçlı basit tutulmuştur: önce `GET` ile sayaç kontrol edilir, ardından `INCR` yapılır — bu iki adım birlikte atomik değildir ve çok eşzamanlı isteklerde limit teorik olarak birkaç istek aşılabilir.
+Redis'in `INCR` işlemi atomiktir ve eşzamanlı sayaç artışlarında veri kaybını önler. TTL ile sayaç otomatik silinir; ayrı temizleme job'u gerekmez. Mevcut limiter eğitim amaçlı basit tutulmuştur: önce `GET` ile sayaç kontrol edilir, ardından `INCR` yapılır — bu iki adım birlikte atomik değildir ve çok eşzamanlı isteklerde limit teorik olarak birkaç istek aşılabilir.
 
 NGINX client IP'sini `X-Forwarded-For` ile Flask'a iletir. Flask uygulaması `ProxyFix(x_for=1)` ile yalnızca önündeki tek NGINX proxy hop'una güvenir; böylece `request.remote_addr` ve Redis'teki rate-limit key'i gerçek client kimliğini kullanır.
 
@@ -217,11 +220,13 @@ Client trafiği doğrudan Flask'a değil `http://localhost` üzerinden NGINX'e g
 
 ## Yol Haritası
 
-NGINX reverse proxy, horizontal Flask scaling, gerçek client IP'siyle rate limiting ve public short URL üretimi tamamlanmıştır. Planlanan sonraki çalışma:
+NGINX reverse proxy, horizontal Flask scaling, gerçek client IP'siyle rate limiting, public short URL üretimi ve k6 mimari deneyleri tamamlanmıştır:
 
 | # | Özellik | Beklenen etki |
 |---|---------|---------------|
-| 1 | **k6 load testing** | Throughput, latency ve rate limit davranışının ölçülmesi |
+| 1 | **k6 mimari deneyleri** ✓ | Cache-hit latency/throughput, replica dağılımı ve rate-limit concurrency davranışı |
+
+k6 çalıştırma komutları için [TESTING.md içindeki k6 bölümüne](TESTING.md#7-k6-mimari-deneyleri), mimari gözlemler, sonuçlar ve öğrenilenler için [k6 load-testing milestone dokümanına](docs/k6-load-testing.md) bakın.
 
 ---
 
