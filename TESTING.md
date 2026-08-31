@@ -14,6 +14,7 @@ Bu dosya, URL Shortener projesini **adım adım test etmek** ve **mimari kavraml
 4. [Kavramsal özet](#4-kavramsal-özet)
 5. [Hızlı komut referansı](#5-hızlı-komut-referansı)
 6. [Sorun giderme](#6-sorun-giderme)
+7. [k6 mimari deneyleri](#7-k6-mimari-deneyleri)
 
 ---
 
@@ -247,7 +248,7 @@ $body = '{"url":"https://www.example.com"}'
 12 -> 429
 ```
 
-**Ne anlama gelir:** İlk 10 istek başarılı (`201 Created`). 11. ve 12. istekler `429 Too Many Requests` döner. Fixed-window limiter: sayaç 60 saniye sonra sıfırlanır.
+**Ne anlama gelir:** İlk 10 istek başarılı (`201 Created`). 11. ve 12. istekler `429 Too Many Requests` döner. Mevcut sayaç, son kabul edilen istekten yaklaşık 60 saniye sonra TTL ile silinir.
 
 ### Adım 3.2 — Rate limit key'ini incele (isteğe bağlı)
 
@@ -302,9 +303,11 @@ Bu bölüm testleri bitirdikten sonra tekrar okumak içindir.
 | Bu projede             | Redirect okuması          | `/shorten` yazması         |
 | Redis boşalırsa        | Sistem çalışır, yavaşlar  | Yazma sırasında zaten dolu |
 
-### Fixed-Window vs Sliding-Window
+### Sayaç + TTL, Fixed-Window ve Sliding-Window
 
-**Fixed-Window** (bu projede kullanılan): Zaman sabit 60 saniyelik bloklara bölünür. Her blokta sayaç sıfırdan başlar; limit aşılırsa 429 döner, blok bitince sayaç tamamen sıfırlanır. Uygulaması basittir — Redis'te `INCR` + `EXPIRE` yeterlidir. Dezavantajı, pencere sınırlarında burst riski taşımasıdır: örneğin 59. saniyede 10 istek ve yeni pencerede hemen 10 istek daha gönderilebilir; kısa sürede 20 istek geçer.
+**Bu projedeki sayaç + TTL yaklaşımı:** Fixed-window fikrinin basitleştirilmiş bir eğitim örneğidir, fakat katı takvim blokları kullanmaz. Kabul edilen her istekte `EXPIRE` tekrar 60 saniyeye ayarlanır. Ayrıca limit kontrolündeki `GET` ile sonraki `INCR` birlikte atomik olmadığı için concurrent istekler nominal limiti aşabilir. Bölüm 7.4 bu davranışı ölçer.
+
+**Fixed-Window** (kavramsal referans): Zaman sabit 60 saniyelik bloklara bölünür. Her blokta sayaç sıfırdan başlar; limit aşılırsa 429 döner, blok bitince sayaç tamamen sıfırlanır. Dezavantajı, pencere sınırlarında burst riski taşımasıdır: örneğin 59. saniyede 10 istek ve yeni pencerede hemen 10 istek daha gönderilebilir; kısa sürede 20 istek geçer.
 
 **Sliding-Window** (gelecek iyileştirme): Sabit blok yerine sürekli olarak son 60 saniyeyi hesaba katar. Her istekte "son 60 sn içinde kaç istek yapıldı?" sorusu yanıtlanır; dağılım daha düzgündür ve pencere sınırındaki burst sorunu azalır. Uygulaması fixed-window'a göre daha karmaşıktır — genelde sorted set veya birden fazla Redis key ile yapılır.
 
@@ -373,10 +376,178 @@ $body = '{"url":"https://www.example.com"}'
 
 ---
 
-## Gelecek güncellemeler
+## 7. k6 mimari deneyleri
 
-NGINX load balancing ve horizontal Flask replica testleri artık bu rehberin mevcut akışına dahildir. Gelecekte eklenecek çalışma:
+Bu deneylerin amacı laptop'un veya Flask development server'ın üretim kapasitesini bulmak değildir. Amaç aynı yerel ortamda tekrarlanabilen karşılaştırmalar yaparak NGINX, üç Flask replica, Redis cache ve PostgreSQL fallback davranışını gözlemlemektir.
 
-| Özellik | Test değişiklikleri |
-|---------|---------------------|
-| k6 load testing | Script'ler, throughput/latency metrikleri, rate limit eşiği |
+### 7.1 k6 kurulumu
+
+Windows Package Manager kullanan PowerShell kullanıcıları:
+
+```powershell
+winget install k6 --source winget
+k6 version
+```
+
+Chocolatey alternatifi:
+
+```powershell
+choco install k6
+k6 version
+```
+
+Güncel kurulum seçenekleri için [Grafana k6 kurulum rehberine](https://grafana.com/docs/k6/latest/set-up/install-k6/) bakın. Yerel kurulum istemiyorsanız repository'deki `k6` Compose servisini kullanabilirsiniz. Bu servis `load-test` profiline aittir; normal `docker compose up` sırasında başlamaz.
+
+Önce uygulama servislerini başlatın:
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+Host'tan çalışan k6 için varsayılan hedef `http://localhost` adresidir. Compose container içinden `localhost` container'ın kendisini gösterdiği için `BASE_URL=http://nginx` kullanılmalıdır. Repository'deki opt-in Compose servisi bunu hazır olarak ayarlar.
+
+### 7.2 Redirect ve cache-hit deneyi
+
+Script: `load-tests/redirect.js`
+
+Script test başlamadan önce `/shorten` ile bir URL oluşturur, yanıttan `short_code` değerini çıkarır ve `BASE_URL/{short_code}` adresine bir warm-up isteği gönderir. API'nin döndürdüğü `short_url` doğrudan kullanılmaz; bu değer container içinden erişilemeyen `http://localhost/...` içerebilir.
+
+Setup aşamasındaki `POST /shorten` aynı IP bazlı rate limit'e tabidir. Redirect deneyini bir rate-limit deneyinden hemen sonra aynı client IP'siyle çalıştırırsanız setup isteği `429` alabilir. Son kabul edilen istekten sonra limiter state'inin süresinin dolmasını bekleyin veya yalnızca disposable yerel Redis'te aşağıda açıklanan bilinçli reset yöntemini kullanın.
+
+Redirect isteklerinde `redirects: 0` kullanılır. Böylece k6 yalnızca NGINX ve URL shortener'ı ölçer; `Location` header'ındaki harici `example.com` adresini takip edip üçüncü taraf bir servise yük göndermez.
+
+Host üzerinden varsayılan çalıştırma:
+
+```powershell
+k6 run .\load-tests\redirect.js
+```
+
+Host üzerinden ayarları değiştirme örneği:
+
+```powershell
+k6 run -e BASE_URL=http://localhost -e VUS=10 -e DURATION=30s .\load-tests\redirect.js
+```
+
+Compose içinden çalıştırma:
+
+```powershell
+docker compose run --rm k6 run /scripts/redirect.js
+```
+
+Bu deney şunları doğrular:
+
+- Setup sırasında kısa URL oluşturulabilir.
+- Warm-up ve yük istekleri `302` döndürür ve doğru `Location` header'ını taşır.
+- Ana yük fazı Redis cache-hit yolunu kullanır.
+- Cache-hit isteklerinin en az yüzde 99'u check'lerden geçer, beklenmeyen HTTP failure oranı yüzde 1'in altında kalır ve p95 süresi 500 ms'nin altında olur.
+
+500 ms eşiği üretim SLO'su değildir; başlangıç için anlaşılır bir yerel guardrail'dir. Aynı makinede tekrarlanan deneyleri karşılaştırdıktan sonra gerekçeli biçimde değiştirilebilir.
+
+#### Replica dağılımını gözlemleme
+
+NGINX her yanıta `X-Upstream-Addr` ekler. Script warm-up upstream adresini ve her VU'nun ilk yanıttaki upstream adresini loglar:
+
+```text
+VU 1 first response used upstream 172.20.0.5:5000
+VU 2 first response used upstream 172.20.0.6:5000
+```
+
+Birden fazla farklı adres görmek, isteklerin birden fazla Flask replica'ya ulaştığına dair basit kanıttır. Küçük bir örnekte kusursuz eşit dağılım beklenmemelidir; bu log karmaşık bir load-balancer ölçüm sistemi değildir.
+
+### 7.3 Cache hit ve cache miss'i ayırma
+
+`redirect.js` bilinçli olarak bir **cache-hit** deneyidir. Warm-up tamamlandıktan sonra aynı kısa kod tekrar tekrar çağrılır ve Redis yolu ölçülür.
+
+Bir kısa kod için Redis'i temizlemek yalnızca sonraki ilk redirect'i miss yapar:
+
+```text
+Redis temizle → ilk GET PostgreSQL fallback → Redis SET → sonraki GET'ler cache hit
+```
+
+Bu nedenle test sırasında bir kez `FLUSHALL` çalıştırıp bütün yükü "cache-miss testi" olarak adlandırmak doğru değildir. Kontrollü cache-miss deneyi için önceden oluşturulmuş çok sayıda farklı kısa kodun cache kayıtları temizlenmeli ve her kod yalnızca bir kez çağrılmalıdır. Bu ayrı bir veri hazırlama ve deney akışıdır; mevcut cache-hit benchmark'ıyla karıştırılmaz. Tek fallback akışını doğrulamak için Bölüm 2'deki manuel test kullanılabilir.
+
+### 7.4 Rate-limit deneyi
+
+Script: `load-tests/rate-limit.js`
+
+Rate-limit sonuçları önceki isteklerden etkilenir. Temiz bir yerel deneyden önce son kabul edilen `/shorten` isteğinden sonra en az 60 saniye bekleyin. Yalnızca disposable Compose Redis'i kullanıyorsanız şu komutla bütün cache ve rate-limit verisini temizleyebilirsiniz:
+
+```powershell
+docker compose exec redis redis-cli FLUSHALL
+```
+
+`FLUSHALL` bütün Redis verisini siler; paylaşılan veya üretim Redis'inde kullanmayın. PostgreSQL kayıtları silinmez.
+
+#### Sıralı mod: nominal davranış
+
+Varsayılan mod tek VU ile 12 isteği sıralı gönderir. Temiz state'te ilk 10 isteğin `201`, sonraki iki isteğin `429` olması beklenir:
+
+```powershell
+k6 run .\load-tests\rate-limit.js
+```
+
+Compose içinden:
+
+```powershell
+docker compose run --rm k6 run /scripts/rate-limit.js
+```
+
+`created_responses=10`, `rate_limited_responses=2` ve başarılı threshold'lar nominal davranışı doğrular.
+
+#### Concurrent mod: mevcut race condition'ı gözlemleme
+
+Önce tekrar 60 saniye bekleyin veya disposable Redis'i temizleyin. Ardından:
+
+```powershell
+k6 run -e MODE=concurrent .\load-tests\rate-limit.js
+```
+
+Compose içinden:
+
+```powershell
+docker compose run --rm -e MODE=concurrent k6 run /scripts/rate-limit.js
+```
+
+Concurrent mod `per-vu-iterations` executor ile varsayılan olarak 20 VU başlatır ve her VU tam olarak bir istek gönderir. Böylece hızlı bir VU'nun paylaşılan iteration havuzundan birden fazla iş alması engellenir ve deney bilinçli olarak VU başına tek concurrent istek üretir. İşletim sistemi ve k6 scheduler'ı bütün paketlerin aynı nanosaniyede ulaşmasını garanti etmez. Mevcut limiter önce Redis `GET`, sonra ayrı bir pipeline ile `INCR` + `EXPIRE` yaptığı için limit kontrolünün tamamı atomik değildir. Birden fazla istek aynı düşük sayaç değerini görürse 10'dan fazla `201` alınabilir.
+
+- `created_responses` 10 ise bu çalıştırmada overshoot gözlenmedi.
+- `created_responses` 10'dan büyükse concurrent istekler nominal limiti aştı.
+- `created_responses: count<=10` threshold'unun kırmızı olması bu modda yararlı deney kanıtıdır; script veya uygulama hatasını gizlemek için eşik değiştirilmez.
+- `rate_limited_responses` kaç isteğin `429` aldığını gösterir.
+
+Bu milestone rate limiter'ı yeniden tasarlamaz. Ayrıca kabul edilen her istekte `EXPIRE` yeniden ayarlandığı için davranış dokümantasyondaki katı takvim tabanlı fixed-window tanımından farklı olabilir. Amaç mevcut davranışı görünür kılmaktır.
+
+### 7.5 Metrikleri okuma
+
+| Metrik | Bu deneylerde anlamı |
+|--------|----------------------|
+| `http_req_duration` | HTTP isteğinin toplam süresi. Redirect scriptindeki tagged threshold yalnızca ana cache-hit fazını değerlendirir. |
+| `http_req_failed` | k6'nın beklenmeyen saydığı yanıtların oranı. Rate-limit scripti `429` yanıtlarını deneyin beklenen sonucu olarak işaretler. |
+| `checks` | Status ve `Location` gibi fonksiyonel kontrollerin başarı oranı. Threshold `rate>0.99` değeridir. |
+| `iterations` | Default test fonksiyonunun kaç kez tamamlandığı. Redirect deneyinde yaklaşık olarak yük fazındaki redirect sayısını temsil eder. |
+| `http_reqs` | Setup dahil toplam HTTP request sayısı; yanındaki `/s` değeri gözlenen throughput'tur. |
+| `p(95)` | İsteklerin yüzde 95'inin bu sürede veya daha hızlı tamamlandığını gösterir; en yavaş yüzde 5 bu değerin üzerindedir. |
+| `created_responses` | Rate-limit deneyinde alınan `201` sayısı. Concurrent modda 10'dan büyük olması overshoot kanıtıdır. |
+| `rate_limited_responses` | Rate-limit deneyinde alınan `429` sayısı. |
+
+Threshold başarısızlığı sonucu silmez; ölçümün belirlenen öğretici guardrail'i karşılamadığını söyler. Önce container loglarını, Docker kaynak kullanımını ve test state'ini inceleyin.
+
+### 7.6 Ölçüm sınırları
+
+- Flask halen development server ile çalışır; sonuçlar production kapasite iddiası değildir.
+- k6 ve servisler aynı bilgisayarda çalışıyorsa CPU, RAM ve Docker Desktop kaynakları için yarışırlar.
+- PostgreSQL ve Redis tek ve paylaşılan instance'lardır; eski veri ve rate-limit key'leri sonucu etkileyebilir.
+- Başarılı her `POST /shorten` PostgreSQL'e kalıcı bir URL satırı ekler. Redirect setup'ı ve rate-limit deneylerindeki `201` yanıtları test verisi oluşturur; tekrarlanan çalıştırmalar URL ID sequence'ini ilerletir.
+- Redis `FLUSHALL` bu PostgreSQL satırlarını veya ID sequence'ini silmez; yalnızca Redis cache ve rate-limit state'ini temizler.
+- Her cache hit için yazılan uygulama logu yüksek yükte ek maliyet ve yoğun log çıktısı oluşturur.
+- `X-Upstream-Addr` örnekleri birden fazla replica kullanımını gösterir, fakat kusursuz round-robin eşitliğini kanıtlamaz.
+- Setup ve warm-up request'leri genel k6 özetine dahil olabilir; cache-hit latency threshold'u `experiment:cache-hit` tag'i ile ana fazı ayrı değerlendirir.
+
+Sonuçları aynı makine, aynı Compose ayarları, aynı VU/duration ve temiz test state'i ile karşılaştırın. Raporlarken komutu, k6 sürümünü ve Docker kaynak ayarlarını kaydedin.
+
+---
+
+## Tamamlanan güncellemeler
+
+NGINX load balancing, horizontal Flask replica doğrulaması ve ayrı k6 cache/rate-limit deneyleri artık bu rehberin mevcut akışına dahildir.
